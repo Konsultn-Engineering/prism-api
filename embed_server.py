@@ -1,161 +1,183 @@
-from fastapi import FastAPI, UploadFile, File, Form
+from fastapi import FastAPI, UploadFile, File, Form, HTTPException
+from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 from sentence_transformers import SentenceTransformer
 from transformers import CLIPProcessor, CLIPModel
-import whisper
 import torch
 import numpy as np
 import tempfile
 import ffmpeg
 from PIL import Image
+from io import BytesIO
 import os
+from functools import lru_cache
 
 app = FastAPI()
 
-# Load models once
-text_model = SentenceTransformer("all-MiniLM-L6-v2")
-asr_model = whisper.load_model("base")
-clip_model = CLIPModel.from_pretrained("openai/clip-vit-base-patch32")
-clip_processor = CLIPProcessor.from_pretrained("openai/clip-vit-base-patch32")
+# === Models with lazy loading and device placement === #
+@lru_cache()
+def get_text_model():
+    # Load sentence transformer model with GPU support if available
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    return SentenceTransformer("all-MiniLM-L6-v2", device=device)
 
+@lru_cache()
+def get_clip_model():
+    # Load CLIP visual model
+    return CLIPModel.from_pretrained("openai/clip-vit-base-patch32")
 
-### === UTILS === ###
+@lru_cache()
+def get_clip_processor():
+    # Load processor for CLIP model (handles image preprocessing)
+    return CLIPProcessor.from_pretrained("openai/clip-vit-base-patch32")
 
+# === Utility Functions === #
 def chunk_and_embed(text: str) -> np.ndarray:
-    tokenizer = text_model.tokenizer
+    # Split long text into <=512-token chunks and average their embeddings
+    model = get_text_model()
+    tokenizer = model.tokenizer
     tokens = tokenizer.tokenize(text)
     if len(tokens) <= 512:
-        return text_model.encode(text)
-    
-    chunks = []
-    for i in range(0, len(tokens), 512):
-        chunk = tokenizer.convert_tokens_to_string(tokens[i:i + 512])
-        chunks.append(text_model.encode(chunk))
-    return np.mean(chunks, axis=0)
+        return model.encode(text)
+    chunks = [tokenizer.convert_tokens_to_string(tokens[i:i + 512]) for i in range(0, len(tokens), 512)]
+    return np.mean([model.encode(chunk) for chunk in chunks], axis=0)
 
 def extract_audio(video_path: str) -> str:
+    # Convert video file to WAV format for transcription
     audio_path = video_path.replace(".mp4", ".wav")
     ffmpeg.input(video_path).output(audio_path, format='wav', acodec='pcm_s16le', ac=1, ar='16000').overwrite_output().run(quiet=True)
     return audio_path
 
 def extract_frames(video_path: str, mode: str = "uniform", max_frames: int = 5) -> list[str]:
-    """
-    Extracts frames from a video using either 'uniform' or 'scene' strategy.
-
-    Args:
-        video_path: Path to the .mp4 file
-        mode: 'uniform' or 'scene'
-        max_frames: Max number of frames to extract
-
-    Returns:
-        List of paths to extracted frame images
-    """
+    # Extract representative frames from the video
     frame_dir = tempfile.mkdtemp()
-    frame_pattern = os.path.join(frame_dir, "frame_%03d.jpg")
+    pattern = os.path.join(frame_dir, "frame_%03d.jpg")
 
+    # Choose frame extraction strategy
     if mode == "scene":
-        (
-            ffmpeg
-            .input(video_path)
-            .output(frame_pattern,
-                    vf="select='gt(scene,0.3)',showinfo",
-                    vsync="vfr")
-            .overwrite_output()
-            .run(quiet=True)
-        )
-    else:  # default to uniform
-        (
-            ffmpeg
-            .input(video_path)
-            .output(frame_pattern,
-                    vf="select=not(mod(n\\,30))",
-                    vframes=max_frames)
-            .overwrite_output()
-            .run(quiet=True)
-        )
+        vf_expr = "select='gt(scene,0.3)',showinfo"
+        vsync = "vfr"
+    else:
+        vf_expr = f"select=not(mod(n\\,{30}))"
+        vsync = None
 
-    all_frames = sorted(os.listdir(frame_dir))[:max_frames]
-    return [os.path.join(frame_dir, f) for f in all_frames]
+    # Run ffmpeg frame extraction
+    ffmpeg.input(video_path).output(
+        pattern,
+        vf=vf_expr,
+        vsync=vsync,
+        vframes=max_frames
+    ).overwrite_output().run(quiet=True)
 
-def get_clip_vector(image: Image.Image) -> np.ndarray:
-    inputs = clip_processor(images=image, return_tensors="pt")
-    return clip_model.get_image_features(**inputs).detach().numpy()[0]
+    # Return paths of extracted frames (up to max_frames)
+    return [os.path.join(frame_dir, f) for f in sorted(os.listdir(frame_dir))[:max_frames]]
 
-def average_vectors(vectors: list[np.ndarray]) -> np.ndarray:
-    return np.mean(np.stack(vectors), axis=0)
+def fuse_vectors(text_vec: np.ndarray, vis_vec: np.ndarray, alpha=0.7, beta=0.3) -> np.ndarray:
+    # Weighted average of text and visual embeddings
+    return (alpha * text_vec + beta * vis_vec)
 
-def fuse_vectors(a: np.ndarray, b: np.ndarray) -> np.ndarray:
-    return (a + b) / 2
+# === Response Model === #
+class EmbedResponse(BaseModel):
+    embedding: list[float]           # Final output embedding vector
+    transcript: str | None = None    # Optional transcript
+    frame_mode: str | None = None    # Optional frame extraction mode
 
-
-### === ENDPOINTS === ###
-
-class Query(BaseModel):
+# === Text Embedding Endpoint === #
+class TextQuery(BaseModel):
     text: str
 
-@app.post("/embed/text")
-def embed_text(q: Query):
-    vector = chunk_and_embed(q.text)
-    return {"embedding": vector.tolist()}
+@app.post("/embed/text", response_model=EmbedResponse)
+async def embed_text(q: TextQuery):
+    try:
+        # Embed input text (chunked if necessary)
+        vector = chunk_and_embed(q.text)
+        return {"embedding": vector.tolist()}
+    except Exception:
+        raise HTTPException(status_code=500)
 
-
-@app.post("/embed/video")
+# === Video Embedding Endpoint === #
+@app.post("/embed/video", response_model=EmbedResponse)
 async def embed_video(
     file: UploadFile = File(...),
     caption: str = Form(""),
     tags: str = Form(""),
-    frame_mode: str = Form("uniform")  # or "scene"
+    frame_mode: str = Form("uniform")
 ):
-    with tempfile.NamedTemporaryFile(delete=False, suffix=".mp4") as tmp:
-        tmp_path = tmp.name
-        tmp.write(await file.read())
+    if file.content_type not in ("video/mp4",):
+        raise HTTPException(status_code=400)
 
-    # Transcribe audio
-    audio_path = extract_audio(tmp_path)
-    transcript = asr_model.transcribe(audio_path)["text"]
-    os.remove(audio_path)
+    # Lazy import Whisper model
+    import whisper
+    asr_model = whisper.load_model("base")
 
-    # Extract and encode multiple frames
-    frame_paths = extract_frames(tmp_path, mode=frame_mode, max_frames=5)
-    images = [Image.open(p).convert("RGB") for p in frame_paths]
-    inputs = clip_processor(images=images, return_tensors="pt", padding=True)
-    features = clip_model.get_image_features(**inputs).detach().numpy()
-    clip_vector = np.mean(features, axis=0)
+    tmp_path = None
+    audio_path = None
+    frame_paths = []
+    try:
+        # Save uploaded video file to disk
+        with tempfile.NamedTemporaryFile(delete=False, suffix=".mp4") as tmp:
+            tmp_path = tmp.name
+            tmp.write(await file.read())
 
-    # Cleanup
-    for p in frame_paths:
-        os.remove(p)
-    os.remove(tmp_path)
+        # Extract audio and transcribe using Whisper
+        audio_path = extract_audio(tmp_path)
+        transcript = asr_model.transcribe(audio_path)["text"]
 
-    # Encode text and fuse
-    combined_text = f"{caption} {tags} {transcript}".strip()
-    text_vector = chunk_and_embed(combined_text)
+        # Extract multiple representative frames
+        frame_paths = extract_frames(tmp_path, mode=frame_mode)
+        images = [Image.open(p).convert("RGB") for p in frame_paths]
 
-    alpha = 0.7
-    beta = 0.3
-    fused_vector = (alpha * text_vector + beta * clip_vector).tolist()
+        # Encode visual content using CLIP
+        processor = get_clip_processor()
+        model = get_clip_model()
+        inputs = processor(images=images, return_tensors="pt", padding=True)
+        features = model.get_image_features(**inputs).detach().numpy()
+        visual_vector = np.mean(features, axis=0)
 
-    return {
-        "embedding": fused_vector,
-        "transcript": transcript,
-        "frame_mode": frame_mode
-    }
+        # Encode combined text content
+        combined_text = f"{caption} {tags} {transcript}".strip()
+        text_vector = chunk_and_embed(combined_text)
 
+        # Fuse embeddings
+        fused = fuse_vectors(text_vector, visual_vector).tolist()
 
-@app.post("/embed/images")
+        return {"embedding": fused, "transcript": transcript, "frame_mode": frame_mode}
+
+    finally:
+        # Cleanup temp audio and video
+        if audio_path and os.path.exists(audio_path):
+            os.remove(audio_path)
+        if tmp_path and os.path.exists(tmp_path):
+            os.remove(tmp_path)
+        for p in frame_paths:
+            if os.path.exists(p):
+                os.remove(p)
+
+# === Image Embedding Endpoint === #
+@app.post("/embed/images", response_model=EmbedResponse)
 async def embed_images(
     files: list[UploadFile] = File(...),
     caption: str = Form(""),
     tags: str = Form("")
 ):
-    images = [Image.open(await f.read()).convert("RGB") for f in files]
-    image_vectors = [get_clip_vector(img) for img in images]
-    image_vector = average_vectors(image_vectors)
+    try:
+        # Convert uploaded images to RGB
+        images = [Image.open(BytesIO(await f.read())).convert("RGB") for f in files]
+        processor = get_clip_processor()
+        model = get_clip_model()
 
-    if caption or tags:
-        text_vector = chunk_and_embed(f"{caption} {tags}")
-        final_vector = fuse_vectors(text_vector, image_vector)
-    else:
-        final_vector = image_vector
+        # Encode images with CLIP
+        inputs = processor(images=images, return_tensors="pt", padding=True)
+        features = model.get_image_features(**inputs).detach().numpy()
+        image_vector = np.mean(features, axis=0)
 
-    return {"embedding": final_vector.tolist()}
+        # Optionally combine with text
+        if caption or tags:
+            text_vector = chunk_and_embed(f"{caption} {tags}")
+            fused = fuse_vectors(text_vector, image_vector).tolist()
+        else:
+            fused = image_vector.tolist()
+
+        return {"embedding": fused}
+    except Exception:
+        raise HTTPException(status_code=500)
