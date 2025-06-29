@@ -1,3 +1,11 @@
+"""
+routes.py
+
+This module defines the API endpoints for the embed-server project, including text, video, 
+and aggregate embedding endpoints. It relies on modular utilities and model interfaces for clean, 
+efficient request handling.
+"""
+
 from fastapi import APIRouter, UploadFile, File, Form, HTTPException
 from PIL import Image
 import tempfile
@@ -6,20 +14,32 @@ import numpy as np
 
 from .models import (
     TextQuery, EmbedResponse, VideoEmbedResponse,
-    PreferenceItem, PreferenceRequest, PreferenceResponse
+    PreferenceRequest, PreferenceResponse
 )
-from .embedding import chunk_and_embed, weighted_average
+from .embedding import (
+    chunk_and_embed, weighted_average,
+    get_clip_model, get_clip_processor, get_whisper_model
+)
 from .video_utils import extract_audio, extract_frames
 
 router = APIRouter()
 
 @router.post("/embed/text", response_model=EmbedResponse)
 async def embed_text(q: TextQuery):
+    """
+    Generate a text embedding for the provided input.
+
+    Args:
+        q (TextQuery): The request body containing the input text.
+
+    Returns:
+        EmbedResponse: The resulting embedding vector.
+    """
     try:
         vector = chunk_and_embed(q.text)
         return {"embedding": vector.tolist()}
-    except Exception:
-        raise HTTPException(status_code=500)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
 
 @router.post("/embed/video", response_model=VideoEmbedResponse)
 async def embed_video(
@@ -28,14 +48,18 @@ async def embed_video(
     tags: str = Form(""),
     frame_mode: str = Form("uniform")
 ):
-    import whisper
-    from transformers import CLIPProcessor, CLIPModel
+    """
+    Generate visual and textual embeddings from a video file, with optional caption and tags.
 
-    # Lazy-load models
-    processor = CLIPProcessor.from_pretrained("openai/clip-vit-base-patch32")
-    model = CLIPModel.from_pretrained("openai/clip-vit-base-patch32")
-    asr_model = whisper.load_model("base")
+    Args:
+        file (UploadFile): Uploaded video file.
+        caption (str, optional): Optional caption describing the video.
+        tags (str, optional): Optional tags for the video content.
+        frame_mode (str, optional): Frame extraction mode ("uniform" or "scene").
 
+    Returns:
+        VideoEmbedResponse: Contains video, content, and transcript embeddings, plus transcript text.
+    """
     tmp_path = None
     audio_path = None
     frame_paths = []
@@ -44,8 +68,9 @@ async def embed_video(
             tmp_path = tmp.name
             tmp.write(await file.read())
 
-        # Transcription
+        # Transcribe audio
         audio_path = extract_audio(tmp_path)
+        asr_model = get_whisper_model()
         transcript = asr_model.transcribe(audio_path)["text"]
 
         # Frame extraction
@@ -53,23 +78,27 @@ async def embed_video(
         images = [Image.open(p).convert("RGB") for p in frame_paths]
 
         # Visual embedding using CLIP
+        processor = get_clip_processor()
+        model = get_clip_model()
         inputs = processor(images=images, return_tensors="pt", padding=True)
         features = model.get_image_features(**inputs).detach().numpy()
         video_embedding = np.mean(features, axis=0)
 
-        # Transcript embedding (pure spoken words)
+        # Transcript embedding
         transcript_embedding = chunk_and_embed(transcript)
 
         # Content embedding (caption + tags + transcript)
         full_text = f"{caption} {tags} {transcript}".strip()
         content_embedding = chunk_and_embed(full_text)
 
-        return {
-            "video_embedding": video_embedding.tolist(),
-            "content_embedding": content_embedding.tolist(),
-            "transcript_embedding": transcript_embedding.tolist(),
-            "transcript": transcript
-        }
+        return VideoEmbedResponse(
+            video_embedding=video_embedding.tolist(),
+            content_embedding=content_embedding.tolist(),
+            transcript_embedding=transcript_embedding.tolist(),
+            transcript=transcript
+        )
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
     finally:
         if audio_path and os.path.exists(audio_path):
             os.remove(audio_path)
@@ -81,6 +110,15 @@ async def embed_video(
 
 @router.post("/embed/aggregate", response_model=PreferenceResponse)
 async def embed_user_preference(body: PreferenceRequest):
+    """
+    Compute a weighted aggregation of user preference embedding vectors.
+
+    Args:
+        body (PreferenceRequest): List of vectors and corresponding weights.
+
+    Returns:
+        PreferenceResponse: Weighted aggregate embedding vector.
+    """
     try:
         visual_vectors = []
         visual_weights = []
@@ -117,7 +155,7 @@ async def embed_user_preference(body: PreferenceRequest):
             raise HTTPException(status_code=400, detail="No valid vectors provided")
 
         final_embedding = weighted_average(components, mod_weights)
-        return {"embedding": final_embedding.tolist()}
+        return PreferenceResponse(embedding=final_embedding.tolist())
 
-    except Exception:
-        raise HTTPException(status_code=500)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
