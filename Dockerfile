@@ -30,8 +30,5 @@ RUN python -m pip install --upgrade pip setuptools wheel urllib3 && \
         -r requirements.txt \
         --extra-index-url https://download.pytorch.org/whl/cpu
 
-RUN python -m pip install ffmpeg-python
-RUN python -m pip install python-multipart
 
-
-CMD ["uvicorn", "embed_server:app", "--host", "0.0.0.0", "--port", "8000"]
+CMD ["python", "main.py"]

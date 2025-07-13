@@ -1,4 +1,4 @@
-# embed-server
+# prism-api
 
 A modular, production-ready API server for generating text, video, and preference embeddings using state-of-the-art transformer models. Built with FastAPI, this server is designed for scalable integration in modern ML and data workflows.
 
